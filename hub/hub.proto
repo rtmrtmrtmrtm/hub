@@ -1,0 +1,20 @@
+//
+// protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative hub.proto
+//
+
+syntax = "proto3";
+
+package hub;
+option go_package = "hub/hub";
+
+service S {
+  rpc R(MQ) returns (MR) { }
+}
+
+message MQ {
+    int32 x = 1;
+}
+
+message MR {
+    string y = 1;
+}
