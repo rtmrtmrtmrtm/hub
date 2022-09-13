@@ -8,13 +8,22 @@ package hub;
 option go_package = "hub/hub";
 
 service S {
-  rpc R(MQ) returns (MR) { }
+  rpc Get(GetQ) returns (GetR) { }
+  rpc Put(PutQ) returns (PutR) { }
 }
 
-message MQ {
-    int32 x = 1;
+message GetQ {
+    string key = 1;
 }
 
-message MR {
-    string y = 1;
+message GetR {
+    string value = 1;
+}
+
+message PutQ {
+    string key = 1;
+    string value = 2;
+}
+
+message PutR {
 }

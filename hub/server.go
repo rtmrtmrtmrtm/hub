@@ -2,7 +2,9 @@ package hub
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/gob"
 	"fmt"
 	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
@@ -10,22 +12,93 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"time"
 )
 
+type CommandType int
+
+const (
+	CommandPut CommandType = 1
+	CommandGet             = 2
+)
+
+// this is what we propose to Raft.
+type Command struct {
+	ID    uint64 // so proposer can tell when (if ever) it was committed.
+	Type  CommandType
+	Key   string
+	Value string
+}
+
+// track the status of a proposed Command.
+type CommandStatus struct {
+	done  bool
+	err   error
+	value string
+}
+
 type HubServer struct {
-	n       raft.Node
-	storage *raft.MemoryStorage
-	c       *raft.Config
-}
-
-type server struct {
 	UnimplementedSServer
+	mu             sync.Mutex
+	n              raft.Node
+	storage        *raft.MemoryStorage
+	c              *raft.Config
+	nextCommandID  uint64
+	scoreboard     map[uint64]*CommandStatus
+	scoreboardCond *sync.Cond
+	db             map[string]string // the data !!!
 }
 
-func (s *server) R(ctx context.Context, in *MQ) (*MR, error) {
-	log.Printf("Received: %v", in.GetX())
-	return &MR{Y: "yyy"}, nil
+func (s *HubServer) Get(ctx context.Context, in *GetQ) (*GetR, error) {
+	log.Printf("Received: Get(%v)", in.GetKey())
+
+	s.mu.Lock()
+
+	cmd := Command{
+		ID:   s.nextCommandID,
+		Type: CommandGet,
+		Key:  in.GetKey(),
+	}
+
+	s.nextCommandID += 1
+
+	// XXX duplicate request suppression!
+
+	// XXX need to make sure we delete the scoreboard entry
+	// no matter what.
+
+	st := &CommandStatus{
+		done:  false,
+		err:   nil,
+		value: "",
+	}
+
+	s.scoreboard[cmd.ID] = st
+
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(cmd); err != nil {
+		log.Fatalf("Get Encode failed: %v", err)
+	}
+
+	s.mu.Unlock()
+
+	s.n.Propose(ctx, buf.Bytes())
+
+	// XXX might be more efficient to have a Cond per CommandStatus.
+
+	// wait for process() to see that Raft committed our Command.
+	// XXX it might never commit, e.g. if leader crashed.
+	s.mu.Lock()
+	for {
+		if st.done {
+			v := st.value
+			delete(s.scoreboard, cmd.ID)
+			s.mu.Unlock()
+			return &GetR{Value: v}, nil
+		}
+		s.scoreboardCond.Wait()
+	}
 }
 
 func (s *HubServer) send_all(mm []raftpb.Message) {
@@ -38,11 +111,37 @@ func (s *HubServer) send_all(mm []raftpb.Message) {
 		hostport := fmt.Sprintf("localhost:%d", 7700+m.To)
 		conn, err := net.Dial("tcp", hostport)
 		if err != nil {
-			log.Printf("Dial failed")
+			// log.Printf("Dial failed")
 			continue
 		}
 		conn.Write(out)
 		conn.Close()
+	}
+}
+
+func (s *HubServer) process(e raftpb.Entry) {
+	if e.Type == raftpb.EntryNormal && len(e.Data) > 0 {
+		var cmd Command
+		dec := gob.NewDecoder(bytes.NewBuffer(e.Data))
+		if err := dec.Decode(&cmd); err != nil {
+			log.Fatalf("process Decode failed: %v", err)
+		}
+		st, ok := s.scoreboard[cmd.ID]
+		if ok == false {
+			log.Printf("hmm, process but no scoreboard[%v]", cmd.ID)
+		} else if st.done == true {
+			log.Printf("hmm, process but scoreboard[%v].done = true", cmd.ID)
+		} else if cmd.Type == CommandGet {
+			st.value = s.db[cmd.Key]
+			st.done = true
+			s.scoreboardCond.Broadcast()
+		} else if cmd.Type == CommandPut {
+			s.db[cmd.Key] = cmd.Value
+			st.done = true
+			s.scoreboardCond.Broadcast()
+		} else {
+			log.Fatalf("process: invalid cmd.Type %v", cmd.Type)
+		}
 	}
 }
 
@@ -65,7 +164,6 @@ func (s *HubServer) peer_listener() {
 			if err != nil {
 				log.Printf("Unmarshal failed: %v", err)
 			} else {
-				log.Printf("!!! %v", m)
 				s.n.Step(context.TODO(), *m)
 			}
 			conn.Close()
@@ -74,23 +172,14 @@ func (s *HubServer) peer_listener() {
 }
 
 func (s *HubServer) ready_loop() {
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			log.Printf("tick\n")
 			s.n.Tick()
 		case rd := <-s.n.Ready():
-			log.Printf("s.n.Ready")
-			log.Printf("  SoftState %v", rd.SoftState)
-			log.Printf("  HardState %v", rd.HardState)
-			log.Printf("  ReadStates %v", rd.ReadStates)
-			log.Printf("  Entries %v", rd.Entries)
-			log.Printf("  Snapshot %v", rd.Snapshot)
-			log.Printf("  CommittedEntries %v", rd.CommittedEntries)
-			log.Printf("  Messages %v", rd.Messages)
-			log.Printf("  MustSync %v", rd.MustSync)
+			//log.Printf("%s", raft.DescribeReady(rd, nil))
 			if !raft.IsEmptySnap(rd.Snapshot) {
 				log.Printf("****** got a snapshot ******")
 				s.storage.ApplySnapshot(rd.Snapshot)
@@ -98,7 +187,7 @@ func (s *HubServer) ready_loop() {
 			s.storage.Append(rd.Entries)
 			s.send_all(rd.Messages)
 			for _, entry := range rd.CommittedEntries {
-				// process(entry)
+				s.process(entry)
 				if entry.Type == raftpb.EntryConfChange {
 					var cc raftpb.ConfChange
 					cc.Unmarshal(entry.Data)
@@ -113,6 +202,10 @@ func (s *HubServer) ready_loop() {
 func MakeServer(myid int) {
 
 	var s HubServer
+
+	s.scoreboard = map[uint64]*CommandStatus{}
+	s.scoreboardCond = sync.NewCond(&s.mu)
+	s.db = map[string]string{}
 
 	s.storage = raft.NewMemoryStorage()
 	s.c = &raft.Config{
@@ -133,13 +226,13 @@ func MakeServer(myid int) {
 	go s.ready_loop()
 
 	// receive client RPCs
-	hostport := fmt.Sprintf(":%d", 50051+myid)
+	hostport := fmt.Sprintf(":%d", 50050+myid)
 	lis, err := net.Listen("tcp", hostport)
 	if err != nil {
 		log.Fatalf("Listen() failed: %v", err)
 	}
 	gs := grpc.NewServer()
-	RegisterSServer(gs, &server{})
+	RegisterSServer(gs, &s)
 
 	go func() {
 		log.Printf("listening at %v", lis.Addr())
@@ -147,5 +240,4 @@ func MakeServer(myid int) {
 			log.Fatalf("Serve() failed: %v", err)
 		}
 	}()
-
 }
