@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -40,7 +41,10 @@ type CommandStatus struct {
 
 type HubServer struct {
 	UnimplementedSServer
+	quitting       atomic.Bool
 	mu             sync.Mutex
+	lis            net.Listener
+	gs             *grpc.Server
 	n              raft.Node
 	storage        *raft.MemoryStorage
 	c              *raft.Config
@@ -63,11 +67,6 @@ func (s *HubServer) Get(ctx context.Context, in *GetQ) (*GetR, error) {
 
 	s.nextCommandID += 1
 
-	// XXX duplicate request suppression!
-
-	// XXX need to make sure we delete the scoreboard entry
-	// no matter what.
-
 	st := &CommandStatus{
 		done:  false,
 		err:   nil,
@@ -85,10 +84,7 @@ func (s *HubServer) Get(ctx context.Context, in *GetQ) (*GetR, error) {
 
 	s.n.Propose(ctx, buf.Bytes())
 
-	// XXX might be more efficient to have a Cond per CommandStatus.
-
 	// wait for process() to see that Raft committed our Command.
-	// XXX it might never commit, e.g. if leader crashed.
 	s.mu.Lock()
 	for {
 		if st.done {
@@ -96,6 +92,48 @@ func (s *HubServer) Get(ctx context.Context, in *GetQ) (*GetR, error) {
 			delete(s.scoreboard, cmd.ID)
 			s.mu.Unlock()
 			return &GetR{Value: v}, nil
+		}
+		s.scoreboardCond.Wait()
+	}
+}
+
+func (s *HubServer) Put(ctx context.Context, in *PutQ) (*PutR, error) {
+	log.Printf("Received: Put(%v, %v)", in.GetKey(), in.GetValue())
+
+	s.mu.Lock()
+
+	cmd := Command{
+		ID:    s.nextCommandID,
+		Type:  CommandPut,
+		Key:   in.GetKey(),
+		Value: in.GetValue(),
+	}
+
+	s.nextCommandID += 1
+
+	st := &CommandStatus{
+		done:  false,
+		err:   nil,
+		value: "",
+	}
+
+	s.scoreboard[cmd.ID] = st
+
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(cmd); err != nil {
+		log.Fatalf("Put Encode failed: %v", err)
+	}
+
+	s.mu.Unlock()
+
+	s.n.Propose(ctx, buf.Bytes())
+
+	s.mu.Lock()
+	for {
+		if st.done {
+			delete(s.scoreboard, cmd.ID)
+			s.mu.Unlock()
+			return &PutR{}, nil
 		}
 		s.scoreboardCond.Wait()
 	}
@@ -128,7 +166,8 @@ func (s *HubServer) process(e raftpb.Entry) {
 		}
 		st, ok := s.scoreboard[cmd.ID]
 		if ok == false {
-			log.Printf("hmm, process but no scoreboard[%v]", cmd.ID)
+			// followers won't have scoreboard entries.
+			// log.Printf("hmm, process but no scoreboard[%v]", cmd.ID)
 		} else if st.done == true {
 			log.Printf("hmm, process but scoreboard[%v].done = true", cmd.ID)
 		} else if cmd.Type == CommandGet {
@@ -147,14 +186,20 @@ func (s *HubServer) process(e raftpb.Entry) {
 
 func (s *HubServer) peer_listener() {
 	hostport := fmt.Sprintf(":%d", 7700+s.c.ID)
-	ln, err := net.Listen("tcp", hostport)
+	lis, err := net.Listen("tcp", hostport)
 	if err != nil {
 		log.Fatalf("cannot Listen(%v): %v", hostport, err)
 	}
+	s.lis = lis
 	for {
-		conn, err := ln.Accept()
+		conn, err := lis.Accept()
 		if err != nil {
-			log.Fatalf("Accept: %v", err)
+			if s.quitting.Load() {
+				// s.Stop() is asking us to quit, so it's OK.
+				break
+			} else {
+				log.Fatalf("Accept: %v", err)
+			}
 		}
 		go func() {
 			rr := bufio.NewReader(conn)
@@ -180,6 +225,7 @@ func (s *HubServer) ready_loop() {
 			s.n.Tick()
 		case rd := <-s.n.Ready():
 			//log.Printf("%s", raft.DescribeReady(rd, nil))
+			s.mu.Lock()
 			if !raft.IsEmptySnap(rd.Snapshot) {
 				log.Printf("****** got a snapshot ******")
 				s.storage.ApplySnapshot(rd.Snapshot)
@@ -195,14 +241,23 @@ func (s *HubServer) ready_loop() {
 				}
 			}
 			s.n.Advance()
+			s.mu.Unlock()
 		}
 	}
 }
 
-func MakeServer(myid int) {
+func (s *HubServer) Stop() {
+	s.quitting.Store(true)
+	s.lis.Close()
+	s.gs.GracefulStop()
+	s.n.Stop()
+}
+
+func MakeServer(myid int) *HubServer {
 
 	var s HubServer
 
+	s.quitting.Store(false)
 	s.scoreboard = map[uint64]*CommandStatus{}
 	s.scoreboardCond = sync.NewCond(&s.mu)
 	s.db = map[string]string{}
@@ -231,13 +286,16 @@ func MakeServer(myid int) {
 	if err != nil {
 		log.Fatalf("Listen() failed: %v", err)
 	}
-	gs := grpc.NewServer()
-	RegisterSServer(gs, &s)
+	s.gs = grpc.NewServer()
+	RegisterSServer(s.gs, &s)
 
 	go func() {
 		log.Printf("listening at %v", lis.Addr())
-		if err := gs.Serve(lis); err != nil {
+		if err := s.gs.Serve(lis); err != nil {
 			log.Fatalf("Serve() failed: %v", err)
 		}
+		log.Printf("gs.Serve() returned")
 	}()
+
+	return &s
 }
