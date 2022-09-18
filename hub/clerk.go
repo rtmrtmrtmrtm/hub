@@ -55,3 +55,15 @@ func (ck *Clerk) Put(key string, value string) {
 		log.Fatalf("Clerk Put failed: %v", err)
 	}
 }
+
+func (ck *Clerk) ExclusiveCreate(key string, value string) bool {
+	ck.connect()
+
+	ctx := context.TODO()
+
+	r, err := ck.c.ExclusiveCreate(ctx, &ExclusiveCreateQ{Key: key, Value: value})
+	if err != nil {
+		log.Fatalf("Clerk Put failed: %v", err)
+	}
+	return r.GetOk()
+}

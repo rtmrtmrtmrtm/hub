@@ -61,3 +61,36 @@ func TestTwo(t *testing.T) {
 	s2.Stop()
 	s3.Stop()
 }
+
+func TestExclusiveCreate(t *testing.T) {
+	s1 := MakeServer(1)
+	s2 := MakeServer(2)
+	s3 := MakeServer(3)
+
+	fff := func(v string, ch chan int) {
+		nck := MakeClerk()
+		ok := nck.ExclusiveCreate("lock", v)
+		if ok {
+			ch <- 1
+		} else {
+			ch <- 0
+		}
+	}
+
+	ch := make(chan int)
+	go fff("1", ch)
+	go fff("2", ch)
+	go fff("3", ch)
+	n := 0
+	n += <-ch
+	n += <-ch
+	n += <-ch
+
+	if n != 1 {
+		t.Fatalf("expecting one success, got %v", n)
+	}
+
+	s1.Stop()
+	s2.Stop()
+	s3.Stop()
+}

@@ -10,6 +10,7 @@ option go_package = "hub/hub";
 service S {
   rpc Get(GetQ) returns (GetR) { }
   rpc Put(PutQ) returns (PutR) { }
+  rpc ExclusiveCreate(ExclusiveCreateQ) returns (ExclusiveCreateR) { }
 }
 
 message GetQ {
@@ -26,4 +27,13 @@ message PutQ {
 }
 
 message PutR {
+}
+
+message ExclusiveCreateQ {
+    string key = 1;
+    string value = 2;
+}
+
+message ExclusiveCreateR {
+    bool ok = 1;
 }

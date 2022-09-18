@@ -22,8 +22,10 @@ import (
 type CommandType int
 
 const (
-	CommandPut CommandType = 1
-	CommandGet             = 2
+	_                      = iota
+	CommandPut CommandType = iota
+	CommandGet
+	CommandExclusiveCreate
 )
 
 // this is what we propose to Raft.
@@ -36,9 +38,10 @@ type Command struct {
 
 // track the status of a proposed Command.
 type CommandStatus struct {
-	done  bool
-	err   error
-	value string
+	done        bool
+	err         error
+	stringValue string
+	boolValue   bool
 }
 
 type HubServer struct {
@@ -56,30 +59,25 @@ type HubServer struct {
 	db             *pebble.DB
 }
 
-func (s *HubServer) Get(ctx context.Context, in *GetQ) (*GetR, error) {
-	log.Printf("Received: Get(%v)", in.GetKey())
-
+// common code to run a client's command through Raft
+// and wait for it to commit.
+func (s *HubServer) handle(ctx context.Context, cmd *Command) *CommandStatus {
 	s.mu.Lock()
 
-	cmd := Command{
-		ID:   s.nextCommandID,
-		Type: CommandGet,
-		Key:  in.GetKey(),
-	}
-
+	cmd.ID = s.nextCommandID
 	s.nextCommandID += 1
 
 	st := &CommandStatus{
-		done:  false,
-		err:   nil,
-		value: "",
+		done:        false,
+		err:         nil,
+		stringValue: "",
 	}
 
 	s.scoreboard[cmd.ID] = st
 
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(cmd); err != nil {
-		log.Fatalf("Get Encode failed: %v", err)
+		log.Fatalf("Encode failed: %v", err)
 	}
 
 	s.mu.Unlock()
@@ -90,55 +88,54 @@ func (s *HubServer) Get(ctx context.Context, in *GetQ) (*GetR, error) {
 	s.mu.Lock()
 	for {
 		if st.done {
-			v := st.value
 			delete(s.scoreboard, cmd.ID)
 			s.mu.Unlock()
-			return &GetR{Value: v}, nil
+			return st
 		}
 		s.scoreboardCond.Wait()
 	}
+
+}
+
+func (s *HubServer) Get(ctx context.Context, in *GetQ) (*GetR, error) {
+	log.Printf("Received: Get(%v)", in.GetKey())
+
+	cmd := Command{
+		Type: CommandGet,
+		Key:  in.GetKey(),
+	}
+
+	st := s.handle(ctx, &cmd)
+
+	return &GetR{Value: st.stringValue}, nil
 }
 
 func (s *HubServer) Put(ctx context.Context, in *PutQ) (*PutR, error) {
 	log.Printf("Received: Put(%v, %v)", in.GetKey(), in.GetValue())
 
-	s.mu.Lock()
-
 	cmd := Command{
-		ID:    s.nextCommandID,
 		Type:  CommandPut,
 		Key:   in.GetKey(),
 		Value: in.GetValue(),
 	}
 
-	s.nextCommandID += 1
+	s.handle(ctx, &cmd)
 
-	st := &CommandStatus{
-		done:  false,
-		err:   nil,
-		value: "",
+	return &PutR{}, nil
+}
+
+func (s *HubServer) ExclusiveCreate(ctx context.Context, in *ExclusiveCreateQ) (*ExclusiveCreateR, error) {
+	log.Printf("Received: ExclusiveCreate(%v, %v)", in.GetKey(), in.GetValue())
+
+	cmd := Command{
+		Type:  CommandExclusiveCreate,
+		Key:   in.GetKey(),
+		Value: in.GetValue(),
 	}
 
-	s.scoreboard[cmd.ID] = st
+	st := s.handle(ctx, &cmd)
 
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(cmd); err != nil {
-		log.Fatalf("Put Encode failed: %v", err)
-	}
-
-	s.mu.Unlock()
-
-	s.n.Propose(ctx, buf.Bytes())
-
-	s.mu.Lock()
-	for {
-		if st.done {
-			delete(s.scoreboard, cmd.ID)
-			s.mu.Unlock()
-			return &PutR{}, nil
-		}
-		s.scoreboardCond.Wait()
-	}
+	return &ExclusiveCreateR{Ok: st.boolValue}, nil
 }
 
 func (s *HubServer) send_all(mm []raftpb.Message) {
@@ -169,25 +166,37 @@ func (s *HubServer) process(e raftpb.Entry) {
 		st, ok := s.scoreboard[cmd.ID]
 		if ok == false {
 			// followers won't have scoreboard entries.
-			// log.Printf("hmm, process but no scoreboard[%v]", cmd.ID)
-		} else if st.done == true {
+			st = &CommandStatus{}
+		}
+		if st.done == true {
+			// don't execute twice!
 			log.Printf("hmm, process but scoreboard[%v].done = true", cmd.ID)
 		} else if cmd.Type == CommandGet {
-			// st.value = s.db[cmd.Key]
-			value, _, _ := s.db.Get([]byte(cmd.Key))
-			st.value = string(value)
-			st.done = true
-			s.scoreboardCond.Broadcast()
+			value, closer, err := s.db.Get([]byte(cmd.Key))
+			st.stringValue = string(value)
+			if err == nil {
+				closer.Close()
+			}
 		} else if cmd.Type == CommandPut {
-			// s.db[cmd.Key] = cmd.Value
 			if err := s.db.Set([]byte(cmd.Key), []byte(cmd.Value), pebble.Sync); err != nil {
 				log.Fatalf("pebble Set: %v", err)
 			}
-			st.done = true
-			s.scoreboardCond.Broadcast()
+		} else if cmd.Type == CommandExclusiveCreate {
+			_, closer, err := s.db.Get([]byte(cmd.Key))
+			if err == nil {
+				st.boolValue = false
+				closer.Close()
+			} else {
+				if err := s.db.Set([]byte(cmd.Key), []byte(cmd.Value), pebble.Sync); err != nil {
+					log.Fatalf("pebble ExclusiveCreate Set: %v", err)
+				}
+				st.boolValue = true
+			}
 		} else {
 			log.Fatalf("process: invalid cmd.Type %v", cmd.Type)
 		}
+		st.done = true
+		s.scoreboardCond.Broadcast()
 	}
 }
 
