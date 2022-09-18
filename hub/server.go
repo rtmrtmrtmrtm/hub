@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/vfs"
 	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 	"google.golang.org/grpc"
@@ -51,7 +53,7 @@ type HubServer struct {
 	nextCommandID  uint64
 	scoreboard     map[uint64]*CommandStatus
 	scoreboardCond *sync.Cond
-	db             map[string]string // the data !!!
+	db             *pebble.DB
 }
 
 func (s *HubServer) Get(ctx context.Context, in *GetQ) (*GetR, error) {
@@ -171,11 +173,16 @@ func (s *HubServer) process(e raftpb.Entry) {
 		} else if st.done == true {
 			log.Printf("hmm, process but scoreboard[%v].done = true", cmd.ID)
 		} else if cmd.Type == CommandGet {
-			st.value = s.db[cmd.Key]
+			// st.value = s.db[cmd.Key]
+			value, _, _ := s.db.Get([]byte(cmd.Key))
+			st.value = string(value)
 			st.done = true
 			s.scoreboardCond.Broadcast()
 		} else if cmd.Type == CommandPut {
-			s.db[cmd.Key] = cmd.Value
+			// s.db[cmd.Key] = cmd.Value
+			if err := s.db.Set([]byte(cmd.Key), []byte(cmd.Value), pebble.Sync); err != nil {
+				log.Fatalf("pebble Set: %v", err)
+			}
 			st.done = true
 			s.scoreboardCond.Broadcast()
 		} else {
@@ -248,7 +255,7 @@ func (s *HubServer) ready_loop() {
 
 func (s *HubServer) Stop() {
 	s.quitting.Store(true)
-	s.lis.Close()
+	s.lis.Close() // and wake up Accept()
 	s.gs.GracefulStop()
 	s.n.Stop()
 }
@@ -260,7 +267,11 @@ func MakeServer(myid int) *HubServer {
 	s.quitting.Store(false)
 	s.scoreboard = map[uint64]*CommandStatus{}
 	s.scoreboardCond = sync.NewCond(&s.mu)
-	s.db = map[string]string{}
+	db, err := pebble.Open("", &pebble.Options{FS: vfs.NewMem()})
+	if err != nil {
+		log.Fatalf("pebble Open: %v", err)
+	}
+	s.db = db
 
 	s.storage = raft.NewMemoryStorage()
 	s.c = &raft.Config{
@@ -294,7 +305,6 @@ func MakeServer(myid int) *HubServer {
 		if err := s.gs.Serve(lis); err != nil {
 			log.Fatalf("Serve() failed: %v", err)
 		}
-		log.Printf("gs.Serve() returned")
 	}()
 
 	return &s

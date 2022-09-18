@@ -11,6 +11,10 @@ func TestOne(t *testing.T) {
 
 	ck := MakeClerk()
 
+	if ck.Get("xyz") != "" {
+		t.Fatalf("key=xyz empty mismatch")
+	}
+
 	ck.Put("xyz", "123")
 	ck.Put("a", "b")
 
@@ -32,9 +36,9 @@ func TestOne(t *testing.T) {
 }
 
 func TestTwo(t *testing.T) {
-	MakeServer(1)
-	MakeServer(2)
-	MakeServer(3)
+	s1 := MakeServer(1)
+	s2 := MakeServer(2)
+	s3 := MakeServer(3)
 
 	fff := func(k string, v string, ch chan bool) {
 		nck := MakeClerk()
@@ -52,4 +56,8 @@ func TestTwo(t *testing.T) {
 	<-ch
 	<-ch
 	<-ch
+
+	s1.Stop()
+	s2.Stop()
+	s3.Stop()
 }
